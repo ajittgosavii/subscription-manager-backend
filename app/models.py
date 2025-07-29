@@ -46,16 +46,6 @@ class PaymentStatus(str, Enum):
     failed = "failed"
     refunded = "refunded"
 
-class UserPlan(str, Enum):
-    free = "free"
-    premium = "premium"
-
-class PaymentStatus(str, Enum):
-    pending = "pending"
-    completed = "completed"
-    failed = "failed"
-    refunded = "refunded"
-
 class Subscription(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
