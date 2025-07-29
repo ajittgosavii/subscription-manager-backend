@@ -1,8 +1,11 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from datetime import datetime, timedelta
 import uuid
+import aiofiles
+import magic
+import os
 
 from app.models import (
     User, UserCreate, Subscription, SubscriptionCreate, 
@@ -10,6 +13,7 @@ from app.models import (
     SavingsReport, SubscriptionStatus, BillStatus
 )
 from app.database import db
+from app.claude_service import claude_detector
 
 app = FastAPI(title="Smart Subscription Manager API", version="1.0.0")
 
@@ -199,26 +203,87 @@ async def detect_subscriptions(user_id: str):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
-    detected_subscriptions = [
-        {
-            "name": "Amazon Prime",
-            "company": "Amazon",
-            "amount": 14.99,
-            "billing_cycle": "monthly",
-            "category": "streaming",
-            "confidence": 0.95
-        },
-        {
-            "name": "Microsoft 365",
-            "company": "Microsoft",
-            "amount": 6.99,
-            "billing_cycle": "monthly", 
-            "category": "software",
-            "confidence": 0.88
-        }
-    ]
+    sample_statement = """
+    BANK STATEMENT - RECENT TRANSACTIONS
+    01/15/2024 NETFLIX.COM         $15.99
+    01/10/2024 SPOTIFY PREMIUM     $9.99
+    01/08/2024 ADOBE CREATIVE      $52.99
+    01/05/2024 AMAZON PRIME        $14.99
+    12/15/2023 NETFLIX.COM         $15.99
+    12/10/2023 SPOTIFY PREMIUM     $9.99
+    12/08/2023 ADOBE CREATIVE      $52.99
+    """
+    
+    detected_subscriptions = await claude_detector.analyze_bank_statement(sample_statement)
     
     return {
-        "message": f"Detected {len(detected_subscriptions)} potential subscriptions",
-        "detected_subscriptions": detected_subscriptions
+        "message": f"AI detected {len(detected_subscriptions)} potential subscriptions",
+        "detected_subscriptions": detected_subscriptions,
+        "ai_powered": claude_detector.client is not None
+    }
+
+@app.post("/api/users/{user_id}/upload-statement")
+async def upload_bank_statement(user_id: str, file: UploadFile = File(...)):
+    user = db.get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if file.size > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large. Maximum size is 10MB.")
+    
+    allowed_types = ['text/plain', 'text/csv', 'application/pdf']
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Unsupported file type. Please upload TXT, CSV, or PDF files.")
+    
+    try:
+        content = await file.read()
+        
+        if file.content_type == 'application/pdf':
+            statement_text = "PDF processing not implemented yet. Using sample data."
+        else:
+            statement_text = content.decode('utf-8')
+        
+        detected_subscriptions = await claude_detector.analyze_bank_statement(statement_text)
+        
+        return {
+            "message": f"Analyzed {file.filename} and detected {len(detected_subscriptions)} potential subscriptions",
+            "detected_subscriptions": detected_subscriptions,
+            "ai_powered": claude_detector.client is not None,
+            "file_processed": file.filename
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+
+@app.get("/api/users/{user_id}/subscription-insights")
+async def get_subscription_insights(user_id: str):
+    user = db.get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    subscriptions = db.get_user_subscriptions(user_id)
+    
+    total_monthly = sum(sub.amount for sub in subscriptions if sub.status == "active" and sub.billing_cycle == "monthly")
+    total_yearly = sum(sub.amount for sub in subscriptions if sub.status == "active" and sub.billing_cycle == "yearly")
+    
+    category_breakdown = {}
+    for sub in subscriptions:
+        if sub.status == "active":
+            if sub.category not in category_breakdown:
+                category_breakdown[sub.category] = {"count": 0, "total": 0}
+            category_breakdown[sub.category]["count"] += 1
+            category_breakdown[sub.category]["total"] += sub.amount
+    
+    unused_count = len([sub for sub in subscriptions if sub.last_used and 
+                       (datetime.utcnow() - sub.last_used).days > 30])
+    
+    return {
+        "total_monthly_cost": total_monthly,
+        "total_yearly_cost": total_yearly,
+        "annual_projection": (total_monthly * 12) + total_yearly,
+        "category_breakdown": category_breakdown,
+        "unused_subscriptions_count": unused_count,
+        "optimization_potential": unused_count * 15.0,
+        "active_subscriptions": len([sub for sub in subscriptions if sub.status == "active"]),
+        "total_subscriptions": len(subscriptions)
     }
