@@ -1,5 +1,5 @@
 from typing import Dict, List, Optional
-from app.models import User, Subscription, BillNegotiation, PriceAlert, SavingsReport, Currency
+from app.models import User, Subscription, BillNegotiation, PriceAlert, SavingsReport, Currency, Payment, UserPlan, PaymentStatus
 import uuid
 from datetime import datetime, timedelta
 
@@ -9,6 +9,7 @@ class InMemoryDatabase:
         self.subscriptions: Dict[str, Subscription] = {}
         self.bill_negotiations: Dict[str, BillNegotiation] = {}
         self.price_alerts: Dict[str, PriceAlert] = {}
+        self.payments: Dict[str, Payment] = {}
         
         self._initialize_sample_data()
     
@@ -18,8 +19,11 @@ class InMemoryDatabase:
             email="demo@example.com",
             name="Demo User",
             currency=Currency.USD,
+            plan=UserPlan.free,
             total_monthly_spending=156.97,
-            total_savings=45.50
+            total_savings=45.50,
+            ai_detections_used=1,
+            ai_detections_limit=2
         )
         self.users[sample_user.id] = sample_user
         
@@ -177,5 +181,54 @@ class InMemoryDatabase:
             total_subscriptions=len(user_subscriptions),
             active_subscriptions=len(active_subs)
         )
+    
+    def create_payment(self, payment: Payment) -> Payment:
+        self.payments[payment.id] = payment
+        return payment
+    
+    def get_payment(self, payment_id: str) -> Optional[Payment]:
+        return self.payments.get(payment_id)
+    
+    def get_user_payments(self, user_id: str) -> List[Payment]:
+        return [payment for payment in self.payments.values() if payment.user_id == user_id]
+    
+    def update_payment(self, payment_id: str, updates: dict) -> Optional[Payment]:
+        if payment_id in self.payments:
+            payment = self.payments[payment_id]
+            for key, value in updates.items():
+                if hasattr(payment, key):
+                    setattr(payment, key, value)
+            payment.updated_at = datetime.utcnow()
+            return payment
+        return None
+    
+    def update_user(self, user_id: str, updates: dict) -> Optional[User]:
+        if user_id in self.users:
+            user = self.users[user_id]
+            for key, value in updates.items():
+                if hasattr(user, key):
+                    setattr(user, key, value)
+            return user
+        return None
+    
+    def can_use_ai_detection(self, user_id: str) -> bool:
+        user = self.get_user(user_id)
+        if not user:
+            return False
+        
+        if user.plan == UserPlan.premium:
+            return True
+        
+        return user.ai_detections_used < user.ai_detections_limit
+    
+    def increment_ai_usage(self, user_id: str) -> bool:
+        user = self.get_user(user_id)
+        if not user:
+            return False
+        
+        if user.plan == UserPlan.free:
+            user.ai_detections_used += 1
+        
+        return True
 
 db = InMemoryDatabase()

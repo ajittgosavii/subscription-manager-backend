@@ -36,6 +36,26 @@ class SubscriptionCategory(str, Enum):
     GAMING = "gaming"
     OTHER = "other"
 
+class UserPlan(str, Enum):
+    free = "free"
+    premium = "premium"
+
+class PaymentStatus(str, Enum):
+    pending = "pending"
+    completed = "completed"
+    failed = "failed"
+    refunded = "refunded"
+
+class UserPlan(str, Enum):
+    free = "free"
+    premium = "premium"
+
+class PaymentStatus(str, Enum):
+    pending = "pending"
+    completed = "completed"
+    failed = "failed"
+    refunded = "refunded"
+
 class Subscription(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
@@ -70,8 +90,13 @@ class User(BaseModel):
     email: str
     name: str
     currency: Currency = Currency.USD
+    plan: UserPlan = UserPlan.free
+    stripe_customer_id: Optional[str] = None
+    subscription_expires_at: Optional[datetime] = None
     total_monthly_spending: float = 0.0
     total_savings: float = 0.0
+    ai_detections_used: int = 0
+    ai_detections_limit: int = 2
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class SavingsReport(BaseModel):
@@ -107,7 +132,22 @@ class BillNegotiationCreate(BaseModel):
     current_amount: float
     target_amount: Optional[float] = None
 
+class Payment(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str
+    stripe_payment_intent_id: str
+    amount: float
+    currency: str
+    status: PaymentStatus = PaymentStatus.pending
+    plan: UserPlan
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
 class UserCreate(BaseModel):
     email: str
     name: str
     currency: Currency = Currency.USD
+
+class PaymentCreate(BaseModel):
+    plan: UserPlan
+    currency: str = "USD"

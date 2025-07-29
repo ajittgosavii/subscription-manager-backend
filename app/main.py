@@ -10,10 +10,12 @@ import os
 from app.models import (
     User, UserCreate, Subscription, SubscriptionCreate, 
     BillNegotiation, BillNegotiationCreate, PriceAlert, 
-    SavingsReport, SubscriptionStatus, BillStatus
+    SavingsReport, SubscriptionStatus, BillStatus,
+    Payment, PaymentCreate, UserPlan, PaymentStatus
 )
 from app.database import db
 from app.claude_service import claude_detector
+from app.stripe_service import stripe_service
 
 app = FastAPI(title="Smart Subscription Manager API", version="1.0.0")
 
@@ -197,11 +199,21 @@ async def get_supported_currencies():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/users/{user_id}/detect-subscriptions")
-async def detect_subscriptions(user_id: str):
+def check_ai_access(user_id: str) -> User:
     user = db.get_user(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    
+    if not db.can_use_ai_detection(user_id):
+        raise HTTPException(
+            status_code=403, 
+            detail=f"AI detection limit reached ({user.ai_detections_used}/{user.ai_detections_limit}). Upgrade to Premium for unlimited access."
+        )
+    return user
+
+@app.post("/api/users/{user_id}/detect-subscriptions")
+async def detect_subscriptions(user_id: str):
+    user = check_ai_access(user_id)
     
     sample_statement = """
     BANK STATEMENT - RECENT TRANSACTIONS
@@ -216,17 +228,18 @@ async def detect_subscriptions(user_id: str):
     
     detected_subscriptions = await claude_detector.analyze_bank_statement(sample_statement)
     
+    db.increment_ai_usage(user_id)
+    
     return {
         "message": f"AI detected {len(detected_subscriptions)} potential subscriptions",
         "detected_subscriptions": detected_subscriptions,
-        "ai_powered": claude_detector.client is not None
+        "ai_powered": claude_detector.client is not None,
+        "remaining_detections": user.ai_detections_limit - user.ai_detections_used - 1 if user.plan == UserPlan.free else "unlimited"
     }
 
 @app.post("/api/users/{user_id}/upload-statement")
 async def upload_bank_statement(user_id: str, file: UploadFile = File(...)):
-    user = db.get_user(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user = check_ai_access(user_id)
     
     if file.size > 10 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="File too large. Maximum size is 10MB.")
@@ -245,11 +258,14 @@ async def upload_bank_statement(user_id: str, file: UploadFile = File(...)):
         
         detected_subscriptions = await claude_detector.analyze_bank_statement(statement_text)
         
+        db.increment_ai_usage(user_id)
+        
         return {
             "message": f"Analyzed {file.filename} and detected {len(detected_subscriptions)} potential subscriptions",
             "detected_subscriptions": detected_subscriptions,
             "ai_powered": claude_detector.client is not None,
-            "file_processed": file.filename
+            "file_processed": file.filename,
+            "remaining_detections": user.ai_detections_limit - user.ai_detections_used - 1 if user.plan == UserPlan.free else "unlimited"
         }
         
     except Exception as e:
@@ -287,3 +303,131 @@ async def get_subscription_insights(user_id: str):
         "active_subscriptions": len([sub for sub in subscriptions if sub.status == "active"]),
         "total_subscriptions": len(subscriptions)
     }
+
+@app.get("/api/users/{user_id}/subscription-status")
+async def get_subscription_status(user_id: str):
+    user = db.get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {
+        "plan": user.plan,
+        "ai_detections_used": user.ai_detections_used,
+        "ai_detections_limit": user.ai_detections_limit,
+        "can_use_ai": db.can_use_ai_detection(user_id),
+        "subscription_expires_at": user.subscription_expires_at,
+        "stripe_customer_id": user.stripe_customer_id
+    }
+
+@app.get("/api/pricing")
+async def get_pricing():
+    return {
+        "plans": {
+            "free": {
+                "name": "Free",
+                "price": 0,
+                "features": [
+                    "Manual subscription tracking",
+                    "2 AI detections per month",
+                    "Basic analytics",
+                    "Multi-currency support"
+                ],
+                "ai_detections": 2
+            },
+            "premium": {
+                "name": "Premium",
+                "price": 9.99,
+                "features": [
+                    "Unlimited AI detections",
+                    "Advanced analytics",
+                    "Bill negotiation assistance",
+                    "Priority support",
+                    "Export capabilities"
+                ],
+                "ai_detections": "unlimited"
+            }
+        },
+        "currencies": ["USD", "EUR", "GBP", "INR", "AUD", "CAD", "JPY"]
+    }
+
+@app.post("/api/users/{user_id}/create-payment-intent")
+async def create_payment_intent(user_id: str, payment_data: PaymentCreate):
+    user = db.get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if user.plan == payment_data.plan:
+        raise HTTPException(status_code=400, detail=f"User already has {payment_data.plan} plan")
+    
+    try:
+        payment_intent_data = await stripe_service.create_payment_intent(
+            user_id=user_id,
+            payment_data=payment_data,
+            customer_id=user.stripe_customer_id
+        )
+        
+        payment = Payment(
+            user_id=user_id,
+            stripe_payment_intent_id=payment_intent_data["payment_intent_id"],
+            amount=payment_intent_data["amount"],
+            currency=payment_data.currency,
+            plan=payment_data.plan,
+            status=PaymentStatus.pending
+        )
+        
+        db.create_payment(payment)
+        
+        return {
+            "client_secret": payment_intent_data["client_secret"],
+            "payment_id": payment.id,
+            "amount": payment_intent_data["amount"],
+            "currency": payment_data.currency
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/payments/{payment_id}/confirm")
+async def confirm_payment(payment_id: str):
+    payment = db.get_payment(payment_id)
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    
+    try:
+        stripe_payment = await stripe_service.confirm_payment(payment.stripe_payment_intent_id)
+        
+        if stripe_payment["status"] == "succeeded":
+            db.update_payment(payment_id, {"status": PaymentStatus.completed})
+            
+            user_updates = {
+                "plan": payment.plan,
+                "subscription_expires_at": datetime.utcnow() + timedelta(days=30)
+            }
+            
+            if payment.plan == UserPlan.premium:
+                user_updates["ai_detections_limit"] = 999999
+            
+            db.update_user(payment.user_id, user_updates)
+            
+            return {
+                "status": "success",
+                "message": "Payment confirmed and subscription activated",
+                "plan": payment.plan
+            }
+        else:
+            db.update_payment(payment_id, {"status": PaymentStatus.failed})
+            return {
+                "status": "failed",
+                "message": "Payment failed"
+            }
+            
+    except Exception as e:
+        db.update_payment(payment_id, {"status": PaymentStatus.failed})
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/users/{user_id}/payments", response_model=List[Payment])
+async def get_user_payments(user_id: str):
+    user = db.get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return db.get_user_payments(user_id)
